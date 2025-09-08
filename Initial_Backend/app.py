@@ -7,6 +7,10 @@ from pathlib import Path
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
+from fastapi import UploadFile, File
+import io
+
+from python_multipart import multipart
 
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "artifacts_xgb"))
 PREPROCESS_PATH = ARTIFACT_DIR / "preprocess_ohe.pkl"
@@ -15,6 +19,28 @@ MODEL_PATH = ARTIFACT_DIR / "booking_risk_xgb_model.pkl"
 # ---------- Load artifacts once ----------
 preprocess = joblib.load(PREPROCESS_PATH)   # sklearn ColumnTransformer (fitted)
 model = joblib.load(MODEL_PATH)             # XGBClassifier (fitted)
+# ---- Compatibility shim for models saved with older/newer xgboost versions
+def _patch_xgb_attrs(xgb):
+    defaults = {
+        # old attrs removed in newer versions
+        "use_label_encoder": False,
+        # attrs present in some builds (GPU) but not others
+        "gpu_id": None,
+        "predictor": None,
+    }
+    patched = []
+    for k, v in defaults.items():
+        if not hasattr(xgb, k):
+            try:
+                setattr(xgb, k, v)
+                patched.append(k)
+            except Exception:
+                pass
+    if patched:
+        print(f"[xgb-patch] added missing attrs: {patched}")
+    return xgb
+
+model = _patch_xgb_attrs(model)
 
 # Columns the preprocess expects as INPUT (before OHE/transform)
 # (sklearn>=1.0 keeps this after fit; else define manually as in training)
@@ -143,6 +169,37 @@ class ScoreOutWithContext(ScoreOut):
 
 app = FastAPI(title="FDR Booking Risk Scorer", version="1.0")
 
+def _score_items(items: List[BookingIn]) -> List[ScoreOutWithContext]:
+    df = pd.DataFrame([it.model_dump() for it in items])
+    df_fe = add_engineered_features(df)
+
+    # asigură coloanele de intrare
+    for col in INPUT_COLS:
+        if col not in df_fe.columns:
+            df_fe[col] = np.nan
+
+    X_in = df_fe[INPUT_COLS]
+    X_tr = preprocess.transform(X_in)
+    probs = model.predict_proba(X_tr)[:, 1]
+
+    results: List[ScoreOutWithContext] = []
+    for i, p in enumerate(probs):
+        b = items[i]
+        tier, reserve, delay = post_policy(float(p), float(b.DAYS_IN_ADVANCE))
+        results.append(ScoreOutWithContext(
+            probability=float(p),
+            risk_score=float(p),
+            risk_tier=tier,
+            suggested_reserve_percent=round(reserve, 2),
+            suggested_settlement_delay_days=delay,
+            merchant_id=b.MERCHANT_ID,
+            vertical=b.VERTICAL,
+            country=b.COUNTRY,
+            days_in_advance=b.DAYS_IN_ADVANCE,
+            booking_amount=b.BOOKING_AMOUNT
+        ))
+    return results
+
 # ---------- Health ----------
 @app.get("/health")
 def health():
@@ -181,7 +238,7 @@ def score_one(b: BookingIn):
 # ---------- Batch scoring ----------
 @app.post("/score_batch", response_model=List[ScoreOutWithContext])
 def score_batch(items: List[BookingIn]):
-    df = pd.DataFrame([it.dict() for it in items])
+    df = pd.DataFrame([it.model_dump() for it in items])
     df_fe = add_engineered_features(df)
 
     for col in INPUT_COLS:
@@ -208,3 +265,46 @@ def score_batch(items: List[BookingIn]):
             booking_amount=b.BOOKING_AMOUNT
         ))
     return results
+
+@app.post("/score_csv")
+async def score_csv(file: UploadFile = File(...)):
+    """
+    Upload a CSV file with booking/merchant data,
+    score all rows, and return predictions as JSON.
+    """
+    # Read CSV into pandas DataFrame
+    content = await file.read()
+    df = pd.read_csv(io.BytesIO(content))
+
+    # Add engineered features (same as training)
+    df = add_engineered_features(df)
+
+    # Ensure all expected columns exist
+    for col in INPUT_COLS:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # Preprocess and predict
+    X_in = df[INPUT_COLS]
+    X_tr = preprocess.transform(X_in)
+    probs = model.predict_proba(X_tr)[:, 1]
+
+    # Apply simple policy
+    outputs = []
+    for i, p in enumerate(probs):
+        row = df.iloc[i].to_dict()
+        tier, reserve, delay = post_policy(float(p), float(row.get("DAYS_IN_ADVANCE", 0)))
+        outputs.append({
+            "merchant_id": row.get("MERCHANT_ID"),
+            "vertical": row.get("VERTICAL"),
+            "country": row.get("COUNTRY"),
+            "days_in_advance": row.get("DAYS_IN_ADVANCE"),
+            "booking_amount": row.get("BOOKING_AMOUNT"),
+            "probability": float(p),
+            "risk_score": float(p),
+            "risk_tier": tier,
+            "suggested_reserve_percent": round(reserve, 2),
+            "suggested_settlement_delay_days": delay
+        })
+
+    return outputs

@@ -6,3 +6,4 @@ numpy==1.26.4
 scikit-learn==1.7.1
 xgboost==1.7.6  # (or your installed version)
 joblib==1.5.2
+python-multipart
