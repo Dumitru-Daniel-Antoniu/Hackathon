@@ -111,21 +111,21 @@ class BookingIn(BaseModel):
     VERTICAL: Optional[str] = None
     COUNTRY: Optional[str] = None
 
-    TRUST_SCORE: float
-    PRIOR_CB_RATE: float
-    REFUND_RATE: float
-    CANCEL_RATE: float
-    SENTIMENT: float
-    SALES_GROWTH_3M: float
-
-    PAYOUT_DELAY_DAYS: float
-    RESERVE_PERCENT: float
-    DEPOSIT_POLICY_PERCENT: float
+    # TRUST_SCORE: Optional[float]
+    # PRIOR_CB_RATE: Optional[float]
+    # REFUND_RATE: Optional[float]
+    # CANCEL_RATE: Optional[float]
+    # SENTIMENT: Optional[float]
+    # SALES_GROWTH_3M: Optional[float]
+    #
+    # PAYOUT_DELAY_DAYS: Optional[float]
+    # RESERVE_PERCENT: Optional[float]
+    # DEPOSIT_POLICY_PERCENT: Optional[float]
 
     DAYS_IN_ADVANCE: float
     BOOKING_AMOUNT: float
-    NEW_MERCHANT: int = Field(..., description="0 or 1")
-    SHOCK_FLAG: int = Field(..., description="0 or 1")
+    # NEW_MERCHANT: Optional[int] = Field(..., description="0 or 1")
+    # SHOCK_FLAG: Optional[int] = Field(..., description="0 or 1")
 
 class ScoreOut(BaseModel):
     probability: float
