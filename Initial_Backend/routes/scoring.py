@@ -1,28 +1,39 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from typing import List
-from schemas.bookings import BookingIn
-from schemas.scoring import  ScoreOutWithContext
-from services.risk_scoring_service import (
-    score_items, score_csv_bytes, RowValidationError, CsvParseError
-)
+from fastapi import APIRouter, HTTPException, UploadFile, File
+from pydantic import BaseModel
+from typing import Optional, List
 
-router = APIRouter(prefix="/score", tags=["scoring"])
+from schemas.bookings import Booking
+from schemas.scoring import ScoreOutWithContext
+from services.risk_scoring_service import score_items, score_csv_bytes, RowValidationError, CsvParseError
 
-@router.post(path = "/individual",response_model=ScoreOutWithContext)
-async def score(payload: BookingIn) -> ScoreOutWithContext:
-    return (await score_batch([payload]))[0]
+router = APIRouter()
 
-@router.post("/batch", response_model=List[ScoreOutWithContext])
-async def score_batch(payloads: List[BookingIn]) -> List[ScoreOutWithContext]:
-    return score_items(payloads)
+@router.post("/score/individual")
+async def score(payload: Booking):
+    try:
+        # ✅ convert to dict
+        return score_items([payload.model_dump()])[0]
+    except RowValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-@router.post("/csv", response_model=List[ScoreOutWithContext])
+@router.post("/score/batch")
+async def score_batch(payloads: List[Booking]):
+    try:
+        # ✅ convert each to dict
+        return score_items([p.model_dump() for p in payloads])
+    except RowValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+@router.post("/score/csv", response_model=List[ScoreOutWithContext])
 async def score_csv(file: UploadFile = File(...)) -> List[ScoreOutWithContext]:
     if not (file.filename or "").lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
+
     data = await file.read()
     try:
-        return score_csv_bytes(data)
+        rows = score_csv_bytes(data)  # -> list[dict]
+        # ✅ enforce response schema
+        return [ScoreOutWithContext(**r) for r in rows]
     except CsvParseError as e:
         raise HTTPException(status_code=400, detail=f"CSV parse error: {e}")
     except RowValidationError as e:

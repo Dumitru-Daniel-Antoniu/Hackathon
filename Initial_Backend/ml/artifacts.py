@@ -1,57 +1,42 @@
-import os
+import os, json
 from pathlib import Path
-
 import joblib
-from functools import lru_cache
+import xgboost as xgb
 
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "artifacts_xgb"))
-PREPROCESS_PATH = ARTIFACT_DIR / "preprocess_ohe.pkl"
-MODEL_PATH = ARTIFACT_DIR / "booking_risk_xgb_model.pkl"
+PKL_PATH     = ARTIFACT_DIR / "xgb_best_model.pkl"
+JSON_PATH    = ARTIFACT_DIR / "xgb_model.json"
+FEATURES_PATH= ARTIFACT_DIR / "feature_list.json"
+CLASSES_PATH = ARTIFACT_DIR / "label_classes.json"
 
-def _patch_xgb_attrs(xgb):
-    defaults = {
-        "use_label_encoder": False,
-        "gpu_id": None,
-        "predictor": None,
-    }
-    patched = []
-    for k, v in defaults.items():
-        if not hasattr(xgb, k):
-            try:
-                setattr(xgb, k, v)
-                patched.append(k)
-            except Exception:
-                pass
-    if patched:
-        print(f"[xgb-patch] added missing attrs: {patched}")
-    return xgb
-
-def _fallback_input_cols():
-    return [
-        # numeric base
-        "TRUST_SCORE","PRIOR_CB_RATE","REFUND_RATE","CANCEL_RATE",
-        "SENTIMENT","SALES_GROWTH_3M","PAYOUT_DELAY_DAYS","RESERVE_PERCENT",
-        "DEPOSIT_POLICY_PERCENT","DAYS_IN_ADVANCE","BOOKING_AMOUNT",
-        "NEW_MERCHANT","SHOCK_FLAG",
-        # engineered numeric
-        "refund_cancel_ratio","shock_adjusted_lead","merchant_stability","high_risk_vertical_flag",
-        # categorical base + engineered
-        "VERTICAL","COUNTRY","days_in_advance_bucket"
-    ]
-
-@lru_cache(maxsize=1)
 def get_artifacts():
-    preprocess = joblib.load(PREPROCESS_PATH)   # fitted ColumnTransformer
-    model = joblib.load(MODEL_PATH)             # fitted XGBClassifier
-    model = _patch_xgb_attrs(model)
+    # Load model (prefer JSON booster if present)
+    if JSON_PATH.exists():
+        model = xgb.XGBClassifier()
+        model.load_model(str(JSON_PATH))
+    elif PKL_PATH.exists():
+        model = joblib.load(PKL_PATH)
+        # Patch quirks for old pickles
+        for k, v in {"use_label_encoder": False, "gpu_id": None, "predictor": None}.items():
+            if not hasattr(model, k):
+                setattr(model, k, v)
+    else:
+        raise FileNotFoundError(f"No model found at {JSON_PATH} or {PKL_PATH}")
 
-    try:
-        input_cols = list(preprocess.feature_names_in_)
-    except Exception:
-        input_cols = _fallback_input_cols()
+    # Feature order (optional but strongly recommended)
+    feature_list = None
+    if FEATURES_PATH.exists():
+        feature_list = json.loads(FEATURES_PATH.read_text())
+
+    # Label classes (for deterministic encodings)
+    classes = {}
+    if CLASSES_PATH.exists():
+        classes = json.loads(CLASSES_PATH.read_text())
 
     return {
-        "preprocess": preprocess,
+        "artifact_dir": ARTIFACT_DIR,
         "model": model,
-        "input_cols": input_cols,
+        "preprocess": None,     # <- important: disable old OHE path
+        "input_cols": feature_list,
+        "classes": classes
     }

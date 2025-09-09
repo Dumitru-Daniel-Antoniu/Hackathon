@@ -10,9 +10,14 @@ class ScoreOut(BaseModel):
     suggested_reserve_percent: float
     suggested_settlement_delay_days: int
 
-class ScoreOutWithContext(ScoreOut):
+class ScoreOutWithContext(BaseModel):
+    probability: float
+    risk_score: float
+    risk_tier: str
+    suggested_reserve_percent: float
+    suggested_settlement_delay_days: int
     merchant_id: Optional[str] = None
     vertical: Optional[str] = None
     country: Optional[str] = None
-    days_in_advance: Optional[float] = None
-    booking_amount: Optional[float] = None
+    days_in_advance: float
+    booking_amount: float
