@@ -1,14 +1,8 @@
-# Ignore everything by default
-/*
-
-# Allow Frontend folder
-!/Frontend/
-
-# Allow gitignore itself
-!.gitignore
-
-# Ignore Python cache files inside Frontend
+.venv
+.idea
+README.md
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+Initial_Backend/.idea
