@@ -83,7 +83,7 @@ def score_via_api(df: pd.DataFrame, base_url: str, chunk: int = 3000) -> pd.Data
         payload = _build_payload(sl, COL_MAP)
 
         items = payload["items"]  # <- extract the list
-        r = requests.post(f"{base}/score_batch", json=items, timeout=120)
+        r = requests.post(f"{base}/score/batch", json=items, timeout=120)
         r.raise_for_status()
 
         # Backend returns a list[ScoreOutWithContext]
