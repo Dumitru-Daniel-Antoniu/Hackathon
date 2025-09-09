@@ -1,0 +1,14 @@
+# Ignore everything by default
+/*
+
+# Allow Frontend folder
+!/Frontend/
+
+# Allow gitignore itself
+!.gitignore
+
+# Ignore Python cache files inside Frontend
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
