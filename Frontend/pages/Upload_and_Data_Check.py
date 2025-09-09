@@ -1,18 +1,23 @@
 # Frontend/pages/Upload_and_Data_Check.py
 import streamlit as st
 import pandas as pd
+from pathlib import Path
 from utilities.api import score_via_api
 
 st.title("📥 Upload & Data Check")
-st.caption("Drop a CSV. If it’s raw, we’ll score it automatically. If it’s already scored, we’ll use it as-is.")
+st.caption("Drop a CSV. If it’s raw, we’ll score it automatically. If it’s already scored, we’ll use it as-is. If no file is uploaded, we’ll use a built-in demo dataset.")
 
 # --- Sidebar: backend URL (shared) ---
 api_base = st.sidebar.text_input("FastAPI base URL", value=st.session_state.get("api_base","http://localhost:8000"))
 st.session_state["api_base"] = api_base
 
+# --- Local default CSV (used when nothing is uploaded) ---
+FRONTEND_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_DATA = FRONTEND_DIR / "default_data" / "Nonscored_bookings.csv"
+
 # --- Defaults to fill if the CSV is raw and lacks model inputs ---
 DEFAULTS = {
-    "mcc": 5999,                          # generic retail fallback
+    "mcc": 5999,
     "trust_score": 65.0,
     "prior_cb_rate": 0.01,
     "refund_rate": 0.05,
@@ -72,45 +77,69 @@ def _ensure_inputs(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def _is_scored(df: pd.DataFrame) -> bool:
-    cols = set(c.lower() for c in df.columns)
-    return {"risk_score", "suggested_reserve_percent", "suggested_settlement_delay_days"}.issubset(cols)
+def _normalize_probs(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure df['risk_probability'] exists in [0,1] and add a pretty % for display."""
+    cols = {c.lower(): c for c in df.columns}
+    if "risk_probability" in cols:
+        df["risk_probability"] = pd.to_numeric(df[cols["risk_probability"]], errors="coerce").clip(0, 1).fillna(0.0)
+    elif "risk_score" in cols:
+        rs = pd.to_numeric(df[cols["risk_score"]], errors="coerce").fillna(0.0)
+        # if risk_score looks like percentages, convert to 0-1
+        df["risk_probability"] = rs.where(rs <= 1.0, rs / 100.0).clip(0, 1)
+    else:
+        df["risk_probability"] = 0.0
+    df["risk_score_pct"] = (df["risk_probability"] * 100).round(2)
+    return df
 
+def _is_already_scored(df: pd.DataFrame) -> bool:
+    low = {c.lower() for c in df.columns}
+    return ("risk_probability" in low) or ("risk_score" in low)
+
+# --- Source selection: upload or default dataset ---
 uploaded = st.file_uploader("Upload bookings CSV", type=["csv"])
 
-if not uploaded:
-    st.info("Tip: you can upload either raw or already-scored CSV.")
-    st.stop()
+if uploaded is not None:
+    raw = pd.read_csv(uploaded)
+    source_label = f"uploaded file ({len(raw):,} rows)"
+else:
+    if DEFAULT_DATA.exists():
+        raw = pd.read_csv(DEFAULT_DATA)
+        source_label = f"default dataset: {DEFAULT_DATA.name} ({len(raw):,} rows)"
+        st.info(f"Using the built-in demo dataset until you upload your own.")
+    else:
+        st.warning("No file uploaded and the default dataset is missing. Please upload a CSV.")
+        st.stop()
 
-raw = pd.read_csv(uploaded)
 raw = _normalize(raw)
 
+# --- Score if needed; otherwise normalize scoring fields ---
 with st.spinner("Processing…"):
-    if _is_scored(raw):
-        scored = raw.copy()
-        st.success("Detected an already-scored file — no API call needed.")
+    if _is_already_scored(raw):
+        scored = _normalize_probs(raw.copy())
+        st.success("Detected a scored file — no API call needed.")
     else:
-        # ensure all inputs then call your backend
         to_score = _ensure_inputs(raw)
-        scored = score_via_api(to_score, st.session_state["api_base"])
+        scored = score_via_api(to_score, st.session_state["api_base"])  # returns df with 'risk_probability'
         st.success("Scored successfully via backend.")
 
-# Make sure we have expected_loss$ for downstream pages
+# --- Business calc: expected loss (risk_probability * booking_amount) ---
 if "expected_loss$" not in scored.columns:
-    scored["expected_loss$"] = pd.to_numeric(scored.get("risk_score", scored.get("probability", 0.0)), errors="coerce").fillna(0.0) \
-                               * pd.to_numeric(scored["booking_amount"], errors="coerce").fillna(0.0)
+    scored["expected_loss$"] = (
+        pd.to_numeric(scored["risk_probability"], errors="coerce").fillna(0.0)
+        * pd.to_numeric(scored["booking_amount"], errors="coerce").fillna(0.0)
+    )
 
 # Persist for other tabs
 st.session_state["scored_df"] = scored
 
-# Quick KPIs
+# KPIs
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Rows", len(scored))
 c2.metric("GMV analyzed", f"${scored['booking_amount'].sum():,.0f}")
-c3.metric("Avg chance of non-delivery", f"{scored.get('risk_score', scored.get('probability', 0.0)).mean():.2%}")
+c3.metric("Avg chance of non-delivery", f"{scored['risk_probability'].mean():.2%}")
 c4.metric("Expected loss (approx)", f"${scored['expected_loss$'].sum():,.0f}")
 
+st.caption(f"Source: **{source_label}**")
 st.dataframe(scored.head(300), use_container_width=True)
 
-# CTA
-st.info("Proceed to **Executive Summary** from the sidebar. Your data is cached for all pages.")
+st.info("Proceed to one of the pages from the sidebar. Your data is cached for all of them.")

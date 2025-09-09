@@ -5,4 +5,5 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-Initial_Backend/.idea
+Initial_Backend/
+

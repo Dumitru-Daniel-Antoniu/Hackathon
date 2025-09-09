@@ -72,50 +72,60 @@ def _build_payload(df: pd.DataFrame, col_map: Dict[str, str]) -> dict:
 
 def score_via_api(df: pd.DataFrame, base_url: str, chunk: int = 3000) -> pd.DataFrame:
     """
-    Sends df to FastAPI /score_batch and returns an enriched DataFrame
-    with risk_score, risk_tier, suggested_reserve_percent, suggested_settlement_delay_days.
+    Send df to FastAPI /score/batch and return an enriched DataFrame.
+    Computes with `probability` (0..1). Also exposes `risk_score_pct` for display.
     """
     base = base_url.rstrip("/")
     results_all = []
 
     for i in range(0, len(df), chunk):
-        sl = df.iloc[i:i+chunk]
+        sl = df.iloc[i:i + chunk]
         payload = _build_payload(sl, COL_MAP)
 
-        items = payload["items"]  # <- extract the list
+        items = payload["items"]  # list to POST
         r = requests.post(f"{base}/score/batch", json=items, timeout=120)
         r.raise_for_status()
 
-        # Backend returns a list[ScoreOutWithContext]
-        batch_results = r.json()
+        batch_results = r.json()  # list[ScoreOutWithContext]
         results_all.extend(batch_results)
 
-    # Convert response list to DataFrame (order preserved = input order)
+    # Convert response to DataFrame (order preserved)
     res_df = pd.DataFrame(results_all)
 
-    # Build output by concatenating original df with response columns
     out = df.reset_index(drop=True).copy()
-    # Align lengths as a sanity check
     if len(out) != len(res_df):
         raise RuntimeError(f"Response length {len(res_df)} != request length {len(out)}")
 
-    wanted = [
-        "risk_score",
-        "risk_tier",
-        "suggested_reserve_percent",
-        "suggested_settlement_delay_days"
-    ]
-    for col in wanted:
-        if col not in res_df.columns:
-            raise RuntimeError(f"Backend response missing column: {col}")
+    # ---- Normalize probability (0..1) regardless of how backend sends it ----
+    if "probability" in res_df.columns:
+        p = pd.to_numeric(res_df["probability"], errors="coerce").clip(0, 1).fillna(0.0)
+    elif "risk_score" in res_df.columns:
+        # risk_score may be 0..1 (legacy) or 0..100 (percent). Normalize to 0..1
+        rs = pd.to_numeric(res_df["risk_score"], errors="coerce").fillna(0.0)
+        p = rs.where(rs <= 1.0, rs / 100.0).clip(0, 1)
+    else:
+        raise RuntimeError("Backend response missing 'probability'/'risk_score'")
 
-    out["risk_score"] = res_df["risk_score"].astype(float)
-    out["risk_tier"] = res_df["risk_tier"].astype(str)
-    out["suggested_reserve_percent"] = res_df["suggested_reserve_percent"].astype(float)
-    out["suggested_settlement_delay_days"] = res_df["suggested_settlement_delay_days"].astype(int)
+    # ---- Copy other fields (with basic sanitation) ----
+    out["risk_probability"] = p
+    out["risk_score_pct"] = (p * 100).round(2)  # nice for display if you still want a % column
 
-    # convenience column for Watchlist/Business tab
+    if "risk_tier" in res_df.columns:
+        out["risk_tier"] = res_df["risk_tier"].astype(str)
+    if "suggested_reserve_percent" in res_df.columns:
+        out["suggested_reserve_percent"] = pd.to_numeric(
+            res_df["suggested_reserve_percent"], errors="coerce"
+        ).fillna(0.0)
+    if "suggested_settlement_delay_days" in res_df.columns:
+        out["suggested_settlement_delay_days"] = pd.to_numeric(
+            res_df["suggested_settlement_delay_days"], errors="coerce"
+        ).fillna(0).astype(int)
+
+    # ---- Business calc: expected loss uses probability (not %!) ----
     if "booking_amount" in out.columns:
-        out["expected_loss$"] = out["risk_score"] * out["booking_amount"].astype(float)
+        out["expected_loss$"] = (
+            out["risk_probability"] * pd.to_numeric(out["booking_amount"], errors="coerce").fillna(0.0)
+        )
 
     return out
+

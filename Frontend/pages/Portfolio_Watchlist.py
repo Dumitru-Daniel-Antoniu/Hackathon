@@ -1,12 +1,13 @@
 # Frontend/pages/3_📋_Portfolio_Watchlist.py
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 
 st.title("📋 Portfolio Watchlist")
 st.caption(
-    "See **where potential non-delivery risk sits** across your portfolio and **which merchants drive it most**. "
-    "We use simple business definitions throughout (see *Glossary* below)."
+    "See **where potential non-delivery risk sits** across your portfolio and **which merchants drive it most** "
+    "(See **Glossary** at the bottom of the page for detailed business definitions)."
 )
 
 df = st.session_state.get("scored_df")
@@ -17,7 +18,7 @@ if df is None:
 # ---- Normalize & core fields
 df = df.copy()
 df.columns = [c.lower() for c in df.columns]
-df["probability"] = pd.to_numeric(df.get("probability", df.get("risk_score", 0.0)), errors="coerce").fillna(0.0)
+df["risk_probability"] = pd.to_numeric(df.get("risk_probability", df.get("risk_score", 0.0)), errors="coerce").fillna(0.0)
 
 # Money at risk ("Exposure")
 if "deposit_policy_percent" in df.columns:
@@ -27,13 +28,15 @@ else:
     df["exposure_$"] = pd.to_numeric(df["booking_amount"], errors="coerce").fillna(0.0)
 
 # Estimated loss = chance × money at risk
-df["estimated_loss_$"] = (df["probability"] * df["exposure_$"]).fillna(0.0)
+df["estimated_loss_$"] = (df["risk_probability"] * df["exposure_$"]).fillna(0.0)
 
 # ---- Filters (kept simple)
 with st.expander("Filters"):
+    i_sel = st.multiselect("Individual merchants", sorted(df["merchant_id"].astype(str).unique()))
     v_sel = st.multiselect("Business type (vertical)", sorted(df["vertical"].astype(str).unique()))
     c_sel = st.multiselect("Buyer country", sorted(df["country"].astype(str).unique()))
     dfv = df.copy()
+    if i_sel: dfv = dfv[dfv["merchant_id"].astype(str).isin(i_sel)]
     if v_sel: dfv = dfv[dfv["vertical"].astype(str).isin(v_sel)]
     if c_sel: dfv = dfv[dfv["country"].astype(str).isin(c_sel)]
 
@@ -42,7 +45,7 @@ fmt_money = lambda x: f"${x:,.0f}"
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Merchants", dfv["merchant_id"].nunique(), help="Distinct merchants in the filtered view.")
 k2.metric("Bookings", len(dfv), help="Number of transactions in the filtered view.")
-k3.metric("Avg chance of non-delivery", f"{dfv['probability'].mean():.2%}",
+k3.metric("Avg risk chance of non-delivery", f"{dfv['risk_probability'].mean():.2%}",
           help="Average model-predicted chance that a booking will not be fulfilled.")
 k4.metric("Estimated loss (approx)", fmt_money(dfv["estimated_loss_$"].sum()),
           help="Sum of (chance × money at risk) across all filtered bookings.")
@@ -66,7 +69,9 @@ fig1 = px.bar(
     labels={"vertical":"Business type", "Estimated_Loss_USD":"Estimated loss ($)"},
     title=None,
 )
-fig1.update_traces(texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False)
+fig1.update_traces(texttemplate="$%{text:,.0f}", textposition="outside",
+                   hovertemplate="<b>%{x}</b><br>Estimated loss ($) = %{y:,.2f}<extra></extra>",
+                   cliponaxis=False)
 st.plotly_chart(fig1, use_container_width=True)
 
 # ---- Table: Top merchants driving estimated loss
@@ -81,10 +86,10 @@ agg = (dfv.groupby(["merchant_id","vertical"], as_index=False)
          .agg(
               bookings=("merchant_id","count"),
               gmv_usd=("booking_amount","sum"),
-              avg_chance=("probability","mean"),
+              avg_chance=("risk_probability","mean"),
               est_loss_usd=("estimated_loss_$","sum"),
-              avg_reserve=(avg_reserve_col, "mean") if avg_reserve_col else ("probability","mean"),
-              avg_delay=(avg_delay_col, "mean") if avg_delay_col else ("probability","mean"),
+              avg_reserve=(avg_reserve_col, "mean") if avg_reserve_col else ("risk_probability","mean"),
+              avg_delay=(avg_delay_col, "mean") if avg_delay_col else ("risk_probability","mean"),
           )
          .sort_values("est_loss_usd", ascending=False))
 
@@ -93,27 +98,26 @@ display = agg.rename(columns={
     "merchant_id":"Merchant",
     "vertical":"Business type",
     "bookings":"Bookings",
-    "gmv_usd":"GMV ($)",
-    "avg_chance":"Avg chance",
+    "gmv_usd":"GMV - Gross Merchandise Value ($)",
+    "avg_chance":"Avg suggested risk chance",
     "est_loss_usd":"Estimated loss ($)",
-    "avg_reserve":"Avg funds held (%)",
-    "avg_delay":"Avg payout delay (days)",
+    "avg_reserve":"Avg suggested funds held (%)",
+    "avg_delay":"Avg suggested payout delay (days)",
 })
-display["GMV ($)"] = display["GMV ($)"].round(0).astype(int).map(lambda x: f"{x:,}")
+display["GMV - Gross Merchandise Value ($)"] = display["GMV - Gross Merchandise Value ($)"].round(0).astype(int).map(lambda x: f"{x:,}")
 display["Estimated loss ($)"] = display["Estimated loss ($)"].round(0).astype(int).map(lambda x: f"{x:,}")
-display["Avg chance"] = (display["Avg chance"]*100).round(1).map(lambda x: f"{x:.1f}%")
+display["Avg suggested risk chance"] = (display["Avg suggested risk chance"]*100).round(1).map(lambda x: f"{x:.1f}%")
 if "Avg funds held (%)" in display.columns:
-    display["Avg funds held (%)"] = display["Avg funds held (%)"].astype(float).round(2)
+    display["Avg suggested funds held (%)"] = display["Avg suggested funds held (%)"].astype(float).round(2)
 if "Avg payout delay (days)" in display.columns:
-    display["Avg payout delay (days)"] = display["Avg payout delay (days)"].astype(float).round(1)
+    display["Avg suggested payout delay (days)"] = display["Avg suggested payout delay (days)"].astype(float).round(1)
 
 st.dataframe(display.head(20), use_container_width=True)
 
 # ---- Heatmap: 10-day horizon buckets × risk tier
 st.subheader("When the risk shows up (service horizon × risk tier)")
 st.caption(
-    "Each column is a **10-day bin** (0–10, 10–20, …, 190–200). "
-    "Cells show **money at risk** for that bin and risk tier."
+    "Which combinations of **booking timing** and **merchant risk level** drive most of the **potential loss**"
 )
 
 # 1) Prepare bins and labels
@@ -152,13 +156,23 @@ matrix = (
 matrix = matrix.reindex(index=tiers_order if "risk_tier" in d.columns else ["All"], fill_value=0)
 matrix = matrix.reindex(columns=labels, fill_value=0)
 
+# Hide tiles where money at risk == 0
+matrix = matrix.astype(float).where(matrix != 0, np.nan)
+
+matrix = matrix.dropna(how="all", axis=0)  # drop empty risk tiers
+matrix = matrix.dropna(how="all", axis=1)  # drop empty horizon buckets
+
 # 3) Plot as a true block heatmap (discrete columns)
 fig2 = px.imshow(
     matrix,
     aspect="auto",
     color_continuous_scale="Reds",
-    labels=dict(x="Days in advance (10-day bins)", y="Risk tier", color="Money at risk ($)"),
+    labels=dict(x="Days in advance", y="Risk tier", color="Money at risk ($)"),
 )
+
+# Cleaner hover + colorbar formatting
+fig2.update_traces(hoverongaps=False, colorbar=dict(tickformat="$,.0f"))
+
 st.plotly_chart(fig2, use_container_width=True)
 
 # ---- Download
