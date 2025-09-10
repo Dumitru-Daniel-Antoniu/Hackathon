@@ -58,14 +58,15 @@ st.caption(PAGE_CAPTION)
 # ---------------------------------------------------------------------------
 # 0) Get the scored dataset prepared on the Upload page
 # ---------------------------------------------------------------------------
-if "scored_df" not in st.session_state:
+df = st.session_state.get("scored_df")
+if df is None:
     st.warning(
         "No scored data found. Go to **Upload & Data Check** first, upload a CSV, and score it. "
         "Then come back to this page."
     )
     st.stop()
 
-df = st.session_state["scored_df"].copy()
+df = df.copy()
 df.columns = [c.strip().lower() for c in df.columns]
 
 # Robust probability accessor (handles risk_probability / risk_score / probability)
