@@ -8,6 +8,35 @@ from services.policy import _policy
 class RowValidationError(Exception): ...
 class CsvParseError(Exception): ...
 
+# services/simple_defaults.py
+SIMPLE_DEFAULTS = {
+    # numerics that won’t swing the model much
+    "trust_score": 60.0,
+    "prior_cb_rate": 0.01,
+    "refund_rate": 0.02,
+    "cancel_rate": 0.03,
+    "sentiment": 0.0,
+    "sales_growth_3m": 0.0,
+    "payout_delay_days": 2.0,
+    "reserve_percent": 5.0,
+    "deposit_policy_percent": 20.0,
+    "new_merchant": 0.0,
+    "age_months": 12.0,
+    "website_uptime": 0.99,
+    "mcc": 0.0,
+
+    # required by colleague model (we’ll overwrite with request)
+    "typical_horizon": 0.0,
+    "base_fdr": 0.0,
+    "shock_flag": 0.0,
+    "days_in_advance": 0.0,
+    "booking_amount": 0.0,
+
+    # cats; adapter will label-encode (“other” buckets)
+    "vertical": "other",
+    "country": "OTHER",
+}
+
 def _to_records_df(payloads):
 
     # Accept dict / list[dict] / DataFrame; reject naked arrays
