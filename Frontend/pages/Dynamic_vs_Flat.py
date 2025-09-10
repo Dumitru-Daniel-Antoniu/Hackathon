@@ -1,171 +1,326 @@
-# Frontend/pages/2_💡_Dynamic_vs_Flat.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Dynamic vs Flat Reserves", layout="wide")
-st.title("💡 Dynamic vs Flat Reserves — How much more do we protect?")
+st.markdown(
+    """
+    <style>
+      .stApp {
+        background: radial-gradient(1100px 600px at 10% -10%, #0b1220 0%, #0b1220 38%, #0e1a2b 60%, #0f2338 80%, #0f273f 100%);
+        color: #e7edf5;
+        overflow: auto;
+      }
+      .block-container { padding-top: 4.5rem; padding-bottom: 0.8rem; }
 
-st.caption(
-    "This view compares a **single flat reserve%** applied to every merchant with our **model’s dynamic reserves**. "
-    "We show **dollars protected** (loss avoided) and the **reserves held** to get there. "
-    "Formulas: per booking, *Expected Loss* = `probability × booking_amount`; "
-    "*Loss absorbed* = `min(Expected Loss, reserves)`; *Net loss left* = `Expected Loss − Loss absorbed` (never negative)."
+      :root { --accent: #19c6d1; --accent-2: #7ae2f2; }
+      h1, h2, h3 { letter-spacing: .2px; }
+
+      .hero {
+        border: 1px solid rgba(255,255,255,0.10);
+        background: linear-gradient(145deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+        border-radius: 20px;
+        padding: 1.6rem 1.8rem;
+        box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+      }
+
+      .subtle { color: #cfe3f2; opacity: .85; font-size: 0.98rem; line-height: 1.6; }
+      .glow { text-shadow: 0 0 24px rgba(26,198,209,.35); }
+
+      .svg-card{
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: .8rem;
+        height: 100%;
+      }
+      .img-caption { margin-top: .5rem; }
+
+      /* Adjusted spacers */
+      .spacer-lg { height: 1.6rem; }
+      .spacer-md { height: 0.8rem; } /* use this before Why section */
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# -----------------------------
-# Load scored data from session
-# -----------------------------
-df = st.session_state.get("scored_df")
-if df is None or df.empty:
-    st.warning("No data in session. Go to **Upload & Data Check** first.")
+PAGE_TITLE = "💡 Dynamic vs Flat — Executive View"
+PAGE_CAPTION = (
+    "Compare a flat reserve policy (same % for every merchant) with the model‑driven "
+    "dynamic policy (different % based on risk). See how much loss you still carry "
+    "and how much cash you need to hold back under each approach."
+)
+
+st.set_page_config(page_title="Dynamic vs Flat Executive", layout="wide")
+st.title(PAGE_TITLE)
+st.caption(PAGE_CAPTION)
+
+# ---------------------------------------------------------------------------
+# 0) Get the scored dataset prepared on the Upload page
+# ---------------------------------------------------------------------------
+if "scored_df" not in st.session_state:
+    st.warning(
+        "No scored data found. Go to **Upload & Data Check** first, upload a CSV, and score it. "
+        "Then come back to this page."
+    )
     st.stop()
 
-df = df.copy()
-df.columns = [c.lower() for c in df.columns]
+df = st.session_state["scored_df"].copy()
+df.columns = [c.strip().lower() for c in df.columns]
 
-# Probability & amount
-if "probability" not in df.columns:
-    # Back-compat: derive from risk_score if needed
-    rs = pd.to_numeric(df.get("risk_score_pct", 0.0), errors="coerce").fillna(0.0)
-    df["probability"] = rs.where(rs <= 1.0, rs / 100.0).clip(0, 1)
+# Robust probability accessor (handles risk_probability / risk_score / probability)
+def _prob_series(d: pd.DataFrame) -> pd.Series:
+    cols = {c.lower(): c for c in d.columns}
+    if "risk_probability" in cols:
+        s = pd.to_numeric(d[cols["risk_probability"]], errors="coerce")
+    elif "risk_score" in cols:
+        s = pd.to_numeric(d[cols["risk_score"]], errors="coerce")
+    elif "probability" in cols:
+        s = pd.to_numeric(d[cols["probability"]], errors="coerce")
+        s = s.where(s <= 1.0, s / 100.0)  # convert 0–100 -> 0–1
+    else:
+        s = pd.Series(0.0, index=d.index)
+    return s.clip(0, 1).fillna(0.0)
 
-amount = pd.to_numeric(df["booking_amount"], errors="coerce").fillna(0.0)
-p = pd.to_numeric(df["probability"], errors="coerce").fillna(0.0).clip(0, 1)
-df["expected_loss"] = p * amount  # EL per booking
+# Fallback dynamic policy if column is missing (mirrors backend formula)
+def _dynamic_percent_fallback(p: pd.Series, days: pd.Series) -> pd.Series:
+    # reserve% = 100*(0.08*p + 0.0009*days), clipped to [0,50]
+    r = 100.0 * (0.08 * p + 0.0009 * pd.to_numeric(days, errors="coerce").fillna(0.0))
+    return r.clip(lower=0.0, upper=50.0)
 
-# Dynamic reserves from the model
+p = _prob_series(df)
+amount = pd.to_numeric(df.get("booking_amount", 0.0), errors="coerce").fillna(0.0)
+
+# Dynamic %: use model output if available; otherwise fallback
 if "suggested_reserve_percent" in df.columns:
-    dyn_pct = pd.to_numeric(df["suggested_reserve_percent"], errors="coerce").fillna(0.0).clip(0, 100)
+    dyn_pct = pd.to_numeric(df["suggested_reserve_percent"], errors="coerce").fillna(0.0)
 else:
-    dyn_pct = pd.Series(0.0, index=df.index)
-    st.warning("Column `suggested_reserve_percent` missing — dynamic policy assumed to be 0% (check your scoring).")
+    dyn_pct = _dynamic_percent_fallback(p, df.get("days_in_advance", 0))
 
-df["reserve_amt_dynamic"] = (dyn_pct / 100.0) * amount
+# Portfolio baselines
+GMV = float(amount.sum())
+EL = float((p * amount).sum())  # Expected Loss with no reserves
 
-# -----------------------------
-# Sidebar — flat policy control
-# -----------------------------
-st.sidebar.header("Policy you want to compare")
-flat_pct = st.sidebar.slider("Flat reserve % (same for every merchant)", 0, 50, 10, 1)
-df["reserve_amt_flat"] = (flat_pct / 100.0) * amount
+# ---------------------------------------------------------------------------
+# 1) Controls (sidebar)
+# ---------------------------------------------------------------------------
+st.sidebar.subheader("Policy you want to compare")
+flat_pct = st.sidebar.slider(
+    "Flat reserve % (same for every merchant)",
+    min_value=0.0,
+    max_value=50.0,
+    value=10.0,
+    step=0.1,
+    format="%.1f",
+    help="This is the single percentage you hold back from every payout, regardless of risk."
+)
 
-# -----------------------------
-# Helpers to aggregate a policy
-# -----------------------------
-def summarize_policy(reserve_amt: pd.Series) -> dict:
-    el = df["expected_loss"]
-    loss_absorbed = np.minimum(el.values, reserve_amt.values)           # per booking
-    net_left = (el.values - loss_absorbed)                              # per booking (>= 0)
+# ---------------------------------------------------------------------------
+# 2) Helper to compute portfolio metrics for a given reserve% vector
+# ---------------------------------------------------------------------------
+def portfolio_metrics(reserve_pct: pd.Series) -> dict:
+    reserve_pct = pd.to_numeric(reserve_pct, errors="coerce").fillna(0.0)
+    # Dollar reserves held (cap at booking amount to avoid >100%)
+    reserves = (reserve_pct / 100.0 * amount).clip(upper=amount)
+    total_reserves = float(reserves.sum())
+
+    # For the simple exec view we mirror your doc logic:
+    # Net loss after reserves = EL - total_reserves (floored at 0)
+    loss_absorbed = float(min(total_reserves, EL))
+    net_loss = float(max(EL - total_reserves, 0.0))
+
     return {
-        "reserves_held": float(reserve_amt.sum()),
-        "loss_absorbed": float(loss_absorbed.sum()),
-        "net_left": float(net_left.sum()),
+        "gmv": GMV,
+        "expected_loss": EL,
+        "reserves_held": total_reserves,
+        "loss_absorbed": loss_absorbed,
+        "net_loss": net_loss,
+        "pct_volume_withheld": (total_reserves / GMV) if GMV > 0 else 0.0,
+        "pct_loss_absorbed": (loss_absorbed / EL) if EL > 0 else 0.0,
     }
 
-dyn = summarize_policy(df["reserve_amt_dynamic"])
-flat = summarize_policy(df["reserve_amt_flat"])
+flat_metrics = portfolio_metrics(pd.Series(flat_pct, index=df.index))
+dyn_metrics = portfolio_metrics(dyn_pct)
 
-portfolio_gmv = float(amount.sum())
-total_el = float(df["expected_loss"].sum())
+# Headline improvement (how much less loss with Dynamic vs Flat)
+savings_vs_flat = flat_metrics["net_loss"] - dyn_metrics["net_loss"]
 
-# Incremental story: how much more do we protect by going dynamic?
-incremental_protection = dyn["loss_absorbed"] - flat["loss_absorbed"]
-incremental_reserves   = dyn["reserves_held"] - flat["reserves_held"]
-roi = (incremental_protection / incremental_reserves) if incremental_reserves > 0 else np.nan
+def money(x: float) -> str:
+    return f"${x:,.0f}"
 
-# -----------------------------
-# KPI strip — plain language
-# -----------------------------
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Portfolio volume (GMV)", f"${portfolio_gmv:,.0f}")
-k2.metric("Total expected loss (EL)", f"${total_el:,.0f}")
-k3.metric("Flat policy — Reserves held", f"${flat['reserves_held']:,.0f}", help="Single % across all merchants.")
-k4.metric("Dynamic policy — Reserves held", f"${dyn['reserves_held']:,.0f}", help="Model-driven % per merchant.")
+def pct(x: float) -> str:
+    return f"{100*x:,.1f}%"
 
-k5, k6, k7 = st.columns(3)
-k5.metric("Dollars protected (flat)", f"${flat['loss_absorbed']:,.0f}")
-k6.metric("Dollars protected (dynamic)", f"${dyn['loss_absorbed']:,.0f}")
-k7.metric("Extra dollars protected by dynamic", f"${incremental_protection:,.0f}",
-          delta=f"{(100*incremental_protection/max(1,total_el)):.1f}% of EL")
-
+# ---------------------------------------------------------------------------
+# 3) Context header for execs
+# ---------------------------------------------------------------------------
+st.subheader("What this page shows")
 st.caption(
-    f"**What this means:** With a flat {flat_pct}% reserve, you protect **${flat['loss_absorbed']:,.0f}**. "
-    f"Using dynamic reserves, you protect **${dyn['loss_absorbed']:,.0f}** — that’s **${incremental_protection:,.0f} more**. "
-    f"The dynamic policy leaves **${dyn['net_left']:,.0f}** of expected loss uncovered versus **${flat['net_left']:,.0f}** with the flat policy."
+    "Left: a **Flat** policy that withholds the same % from every merchant. "
+    "Right: a **Dynamic** policy that withholds more where risk is higher and less where it’s lower. "
 )
 
-# -----------------------------
-# Bars — protection vs reserves
-# -----------------------------
-bar = go.Figure()
-bar.add_bar(name=f"Loss avoided (protected $)", x=["Flat", "Dynamic"],
-            y=[flat["loss_absorbed"], dyn["loss_absorbed"]])
-bar.add_bar(name=f"Reserves held ($)", x=["Flat", "Dynamic"],
-            y=[flat["reserves_held"], dyn["reserves_held"]])
-bar.update_layout(
-    barmode="group",
-    title=f"Protection vs Cost — Flat {flat_pct}% vs Dynamic",
-    yaxis_title="$",
-    legend_title="Measure",
-)
-st.plotly_chart(bar, use_container_width=True)
+# Portfolio top line
+t1, t2 = st.columns(2)
+with t1:
+    st.metric("Portfolio volume (GMV)", money(GMV))
+with t2:
+    st.metric("Expected loss with no reserves", money(EL))
 
-# -----------------------------
-# ROI card — incremental view
-# -----------------------------
-with st.expander("How efficient is the extra buffer?", expanded=False):
-    st.markdown(
-        f"- **Extra dollars protected by dynamic (vs flat {flat_pct}%):** "
-        f"**${incremental_protection:,.0f}**  \n"
-        f"- **Extra reserves held (vs flat):** ${incremental_reserves:,.0f}  \n"
-        f"- **ROI of extra reserves:** {('' if np.isfinite(roi) else 'n/a ')}"
-        f"{'' if not np.isfinite(roi) else f'${roi:,.2f} protected per $1 of extra reserves'}"
-    )
+
+st.divider()
+# ---------------------------------------------------------------------------
+# 4) Split view: Flat (left) vs Dynamic (right)
+# ---------------------------------------------------------------------------
+left, right = st.columns(2)
+
+with left:
+    st.markdown("### Flat policy")
     st.caption(
-        "Interpretation: ROI > 1 means every additional $1 reserved by the dynamic policy protects more than $1 of expected loss in aggregate."
+        f"You set a single percentage for everyone. The slider is currently **{flat_pct}%**. "
+    )
+    st.metric("Reserves held", money(flat_metrics["reserves_held"]),
+              help="How much cash you would withhold from payouts under this flat %.")
+    st.metric("Net loss after reserves", money(flat_metrics["net_loss"]),
+              help="What you still expect to lose after applying reserves.")
+    st.metric("% of loss absorbed", pct(flat_metrics["pct_loss_absorbed"]))
+    st.metric("% of volume withheld", pct(flat_metrics["pct_volume_withheld"]))
+
+with right:
+    st.markdown("### Dynamic policy")
+    st.caption(
+        "The model recommends a different reserve % per booking, based on risk. "
+    )
+    st.metric("Reserves held", money(dyn_metrics["reserves_held"]))
+    st.metric("Net loss after reserves", money(dyn_metrics["net_loss"]))
+    st.metric("% of loss absorbed", pct(dyn_metrics["pct_loss_absorbed"]))
+    st.metric("% of volume withheld", pct(dyn_metrics["pct_volume_withheld"]))
+
+# ---------------------------------------------------------------------------
+# 5) Callout: business impact vs Flat
+# ---------------------------------------------------------------------------
+if savings_vs_flat > 0:
+    st.success(
+        f"**Money saved with Dynamic vs Flat {flat_pct}%:** {money(savings_vs_flat)} **gained** using Dynamic Policy "
+        f"({pct((savings_vs_flat / EL) if EL > 0 else 0)} of total expected loss)."
+    )
+elif savings_vs_flat < 0:
+    st.warning(
+        f"Dynamic would result in **{money(-savings_vs_flat)} more** expected loss than Flat {flat_pct}% "
+        f"(at these parameters)."
+    )
+else:
+    st.info("Dynamic and Flat result in the same expected loss at the current setting.")
+
+# “Cash vs. Risk Left” — grouped bars
+policies = ["Flat", "Dynamic"]
+recovered = [flat_metrics["loss_absorbed"], dyn_metrics["loss_absorbed"]]
+
+# Optional: per-$ efficiency (how many $ of loss are covered per $1 reserved)
+efficiency = []
+for m in (flat_metrics, dyn_metrics):
+    eff = (m["loss_absorbed"] / m["reserves_held"]) if m["reserves_held"] > 0 else 0.0
+    efficiency.append(eff)
+
+fig1 = go.Figure(go.Bar(
+    name="Loss absorbed (recovered)",
+    x=policies,
+    y=recovered,
+    text=[money(v) for v in recovered],           # "$" labels on top of bars
+    textposition="outside",
+    customdata=efficiency,                         # attach efficiency for hover
+    hovertemplate=(
+        "%{x}<br>"
+        "Money regained: %{y:$,.0f}<br>"
+        "<extra></extra>"
+    )
+))
+
+fig1.update_layout(
+    title="How much money was recovered according to each policy. The bigger the better.",
+    yaxis_title="USD",
+    showlegend=False,
+    margin=dict(t=60, b=40),
+)
+
+st.plotly_chart(fig1, use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# 6) Optional: show the two reserve curves as a quick table preview
+# ---------------------------------------------------------------------------
+with st.expander("See sample of reserves per booking (preview)"):
+    # Build the base table (uses variables defined earlier in the page)
+    flat_series = pd.Series(float(flat_pct), index=df.index)  # flat % per row
+
+    table_df = pd.DataFrame({
+        "merchant_id": df.get("merchant_id", pd.Series("", index=df.index)).astype(str),
+        "vertical": df.get("vertical", pd.Series("", index=df.index)).astype(str),
+        "booking_amount": amount,
+        "risk_probability": p,
+        "flat_reserve_%": flat_series,
+        "dynamic_reserve_%": pd.to_numeric(dyn_pct, errors="coerce").fillna(0.0),
+    })
+
+    # ---- Filters UI ----
+    f1, f2, f3 = st.columns([2, 2, 1])
+    with f1:
+        merchant_q = st.text_input(
+            "Filter by merchant_id (comma-separated; partial match OK)",
+            placeholder="e.g., M0123, M045"
+        )
+    with f2:
+        # Collect unique verticals (case-insensitive label)
+        vertical_options = sorted(
+            table_df["vertical"].dropna().astype(str).str.strip().unique().tolist()
+        )
+        selected_verticals = st.multiselect(
+            "Filter by vertical",
+            options=vertical_options,
+            placeholder="Pick one or more"
+        )
+    with f3:
+        max_rows = int(min(1000, len(table_df)))
+        show_n = st.number_input("Rows", min_value=10, max_value=max_rows, value=min(50, max_rows), step=10)
+
+    # ---- Apply filters ----
+    mask = pd.Series(True, index=table_df.index)
+
+    # Merchant filter (supports multiple tokens, partial, case-insensitive)
+    if merchant_q.strip():
+        toks = [t.strip().lower() for t in merchant_q.split(",") if t.strip()]
+        mask &= table_df["merchant_id"].str.lower().apply(
+            lambda x: any(tok in x for tok in toks)
+        )
+
+    # Vertical filter (exact match against selected values)
+    if selected_verticals:
+        mask &= table_df["vertical"].isin(selected_verticals)
+
+    filtered = table_df[mask]
+
+    display_df = filtered.head(int(show_n))
+
+    # Small summary + table
+    st.caption(f"Showing {len(display_df):,} of {len(filtered):,} rows")
+    st.dataframe(filtered.head(int(show_n)), use_container_width=True)
+
+    # Download filtered CSV
+    st.download_button(
+        "Download filtered CSV",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="reserves_preview_filtered.csv",
+        mime="text/csv",
     )
 
-# -----------------------------
-# Presentation-ready table
-# -----------------------------
-def percent(x):
-    return f"{(x/portfolio_gmv*100):.1f}%" if portfolio_gmv > 0 else "0.0%"
-
-summary = pd.DataFrame([
-    {"Policy": f"Flat {flat_pct}%", "Reserves held ($)": flat["reserves_held"],
-     "% of volume held": percent(flat["reserves_held"]),
-     "Loss avoided ($)": flat["loss_absorbed"],
-     "% of EL absorbed": f"{(flat['loss_absorbed']/total_el*100 if total_el>0 else 0):.1f}%",
-     "Net loss left ($)": flat["net_left"]},
-    {"Policy": "Dynamic (model)", "Reserves held ($)": dyn["reserves_held"],
-     "% of volume held": percent(dyn["reserves_held"]),
-     "Loss avoided ($)": dyn["loss_absorbed"],
-     "% of EL absorbed": f"{(dyn['loss_absorbed']/total_el*100 if total_el>0 else 0):.1f}%",
-     "Net loss left ($)": dyn["net_left"]},
-])
-
-# Friendly formatting for display
-disp = summary.copy()
-for col in ["Reserves held ($)","Loss avoided ($)","Net loss left ($)"]:
-    disp[col] = disp[col].map(lambda v: f"${v:,.0f}")
-st.subheader("Policy comparison (portfolio totals)")
-st.dataframe(disp, use_container_width=True)
-
-# -----------------------------
-# One-sentence executive takeaway
-# -----------------------------
-delta_saved = flat["net_left"] - dyn["net_left"]
-st.success(
-    f"**Executive takeaway:** Switching from a flat {flat_pct}% to the dynamic policy would protect "
-    f"**${incremental_protection:,.0f} more** of expected loss, reducing uncovered risk by **${delta_saved:,.0f}**."
-)
-
-# Optional download
-st.download_button(
-    "⬇️ Download comparison (CSV)",
-    data=summary.to_csv(index=False).encode("utf-8"),
-    file_name=f"dynamic_vs_flat_{flat_pct}pct.csv",
-    mime="text/csv",
-)
+# ---------------------------------------------------------------------------
+# 7) Footer explainer
+# ---------------------------------------------------------------------------
+with st.expander("📘 Glossary"):
+    st.markdown("""
+- **Reserves held ($)** — Cash you withhold from payouts under a policy.
+- **% of volume withheld** — Reserves held divided by GMV; shows the liquidity impact on merchants.
+- **Loss absorbed ($)** — Expected loss that is covered by reserves (cannot exceed the reserves you hold).
+- **Net loss after reserves ($)** — What you still expect to lose after applying reserves.
+- **Flat policy** — One reserve percentage applied to every merchant/booking.
+- **Dynamic policy** — Model-recommended reserve percentage that varies by booking risk (more where risk is higher, less where it’s lower).
+""")

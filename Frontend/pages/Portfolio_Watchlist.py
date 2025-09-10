@@ -1,8 +1,48 @@
-# Frontend/pages/3_📋_Portfolio_Watchlist.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+
+st.markdown(
+    """
+    <style>
+      .stApp {
+        background: radial-gradient(1100px 600px at 10% -10%, #0b1220 0%, #0b1220 38%, #0e1a2b 60%, #0f2338 80%, #0f273f 100%);
+        color: #e7edf5;
+        overflow: auto;
+      }
+      .block-container { padding-top: 4.5rem; padding-bottom: 0.8rem; }
+
+      :root { --accent: #19c6d1; --accent-2: #7ae2f2; }
+      h1, h2, h3 { letter-spacing: .2px; }
+
+      .hero {
+        border: 1px solid rgba(255,255,255,0.10);
+        background: linear-gradient(145deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+        border-radius: 20px;
+        padding: 1.6rem 1.8rem;
+        box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+      }
+
+      .subtle { color: #cfe3f2; opacity: .85; font-size: 0.98rem; line-height: 1.6; }
+      .glow { text-shadow: 0 0 24px rgba(26,198,209,.35); }
+
+      .svg-card{
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: .8rem;
+        height: 100%;
+      }
+      .img-caption { margin-top: .5rem; }
+
+      /* Adjusted spacers */
+      .spacer-lg { height: 1.6rem; }
+      .spacer-md { height: 0.8rem; } /* use this before Why section */
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("📋 Portfolio Watchlist")
 st.caption(
@@ -47,16 +87,16 @@ k1.metric("Merchants", dfv["merchant_id"].nunique(), help="Distinct merchants in
 k2.metric("Bookings", len(dfv), help="Number of transactions in the filtered view.")
 k3.metric("Avg risk chance of non-delivery", f"{dfv['risk_probability'].mean():.2%}",
           help="Average model-predicted chance that a booking will not be fulfilled.")
-k4.metric("Estimated loss (approx)", fmt_money(dfv["estimated_loss_$"].sum()),
+k4.metric("Potential recovery (approx)", fmt_money(dfv["estimated_loss_$"].sum()),
           help="Sum of (chance × money at risk) across all filtered bookings.")
 
 st.markdown("")
 
 # ---- Chart 1: Risk concentration by business type
-st.subheader("Where the **money at risk** concentrates (by business type)")
+st.subheader("Where the **money at risk** can be **regained** (by business type)")
 st.caption(
-    "Bars show **estimated loss in dollars** by business type (vertical). "
-    "Taller bars = **more dollars at risk** in that category."
+    "Bars show **estimated dollars to save** by business type (vertical). "
+    "Taller bars = **More potential money** that can be recovered in that category."
 )
 by_vert = (dfv.groupby("vertical", as_index=False)
              .agg(Estimated_Loss_USD=("estimated_loss_$", "sum"),
@@ -66,16 +106,16 @@ by_vert = (dfv.groupby("vertical", as_index=False)
 fig1 = px.bar(
     by_vert.head(12),
     x="vertical", y="Estimated_Loss_USD", text="Estimated_Loss_USD",
-    labels={"vertical":"Business type", "Estimated_Loss_USD":"Estimated loss ($)"},
+    labels={"vertical":"Business type", "Estimated_Loss_USD":"Potential gain ($)"},
     title=None,
 )
 fig1.update_traces(texttemplate="$%{text:,.0f}", textposition="outside",
-                   hovertemplate="<b>%{x}</b><br>Estimated loss ($) = %{y:,.2f}<extra></extra>",
+                   hovertemplate="<b>%{x}</b><br>Estimated gain ($) = %{y:,.2f}<extra></extra>",
                    cliponaxis=False)
 st.plotly_chart(fig1, use_container_width=True)
 
 # ---- Table: Top merchants driving estimated loss
-st.subheader("Top merchants by **estimated loss**")
+st.subheader("Top merchants by **estimated potential gain**")
 st.caption("This helps you **prioritize outreach / policy changes** where it matters most.")
 
 # Friendly fallbacks if suggested_* columns aren’t present
@@ -100,12 +140,12 @@ display = agg.rename(columns={
     "bookings":"Bookings",
     "gmv_usd":"GMV - Gross Merchandise Value ($)",
     "avg_chance":"Avg suggested risk chance",
-    "est_loss_usd":"Estimated loss ($)",
+    "est_loss_usd":"Estimated potential gain ($)",
     "avg_reserve":"Avg suggested funds held (%)",
     "avg_delay":"Avg suggested payout delay (days)",
 })
 display["GMV - Gross Merchandise Value ($)"] = display["GMV - Gross Merchandise Value ($)"].round(0).astype(int).map(lambda x: f"{x:,}")
-display["Estimated loss ($)"] = display["Estimated loss ($)"].round(0).astype(int).map(lambda x: f"{x:,}")
+display["Estimated potential gain ($)"] = display["Estimated potential gain ($)"].round(0).astype(int).map(lambda x: f"{x:,}")
 display["Avg suggested risk chance"] = (display["Avg suggested risk chance"]*100).round(1).map(lambda x: f"{x:.1f}%")
 if "Avg funds held (%)" in display.columns:
     display["Avg suggested funds held (%)"] = display["Avg suggested funds held (%)"].astype(float).round(2)
@@ -117,7 +157,7 @@ st.dataframe(display.head(20), use_container_width=True)
 # ---- Heatmap: 10-day horizon buckets × risk tier
 st.subheader("When the risk shows up (service horizon × risk tier)")
 st.caption(
-    "Which combinations of **booking timing** and **merchant risk level** drive most of the **potential loss**"
+    "Which combinations of **booking timing** and **merchant risk level** have the most **money to regain**"
 )
 
 # 1) Prepare bins and labels
@@ -167,7 +207,7 @@ fig2 = px.imshow(
     matrix,
     aspect="auto",
     color_continuous_scale="Reds",
-    labels=dict(x="Days in advance", y="Risk tier", color="Money at risk ($)"),
+    labels=dict(x="Days in advance", y="Risk tier", color="Money to regain ($)"),
 )
 
 # Cleaner hover + colorbar formatting

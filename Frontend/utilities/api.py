@@ -1,3 +1,4 @@
+# utilities/api.py
 import pandas as pd
 import requests
 from typing import Dict, List
@@ -36,25 +37,22 @@ _NUMERIC_INT = ["NEW_MERCHANT","SHOCK_FLAG"]
 # Optional context fields (can be absent/NaN and will be dropped from payload)
 _OPTIONAL = ["MERCHANT_ID","MCC","VERTICAL","COUNTRY"]
 
+
 def _build_payload(df: pd.DataFrame, col_map: Dict[str, str]) -> dict:
-    # Check columns exist
     missing = [c for c in col_map.keys() if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in CSV: {missing}")
 
     df = df.reset_index(drop=True).copy()
-
-    # Remap to backend names (keep a copy of original df for merging later)
     backend_cols = {col_map[k]: k for k in col_map.keys()}
 
     items: List[dict] = []
     for _, row in df.iterrows():
         item = {}
-        # Fill mapped fields
         for be_name, csv_name in backend_cols.items():
             val = row[csv_name]
 
-            # Skip optional fields if NaN/None
+            # Skip optional fields if NaN/empty
             if be_name in _OPTIONAL and (pd.isna(val) or val == ""):
                 continue
 
@@ -70,55 +68,66 @@ def _build_payload(df: pd.DataFrame, col_map: Dict[str, str]) -> dict:
 
     return {"items": items}
 
+
+def _to_unit_interval(series: pd.Series) -> pd.Series:
+    """Convert numeric to [0,1]; if values look like percentages (>1), divide by 100."""
+    s = pd.to_numeric(series, errors="coerce")
+    s = s.where(s <= 1.0, s / 100.0)
+    return s.clip(0, 1).fillna(0.0)
+
+
 def score_via_api(df: pd.DataFrame, base_url: str, chunk: int = 3000) -> pd.DataFrame:
     """
     Send df to FastAPI /score/batch and return an enriched DataFrame.
-    Computes with `probability` (0..1). Also exposes `risk_score_pct` for display.
+    Produces:
+      - risk_probability (0..1)
+      - risk_score_pct (0..100)
+      - risk_tier, suggested_reserve_percent, suggested_settlement_delay_days
+      - expected_loss$
     """
     base = base_url.rstrip("/")
-    results_all = []
+    results_all: List[dict] = []
 
     for i in range(0, len(df), chunk):
         sl = df.iloc[i:i + chunk]
         payload = _build_payload(sl, COL_MAP)
-
-        items = payload["items"]  # list to POST
-        r = requests.post(f"{base}/score/batch", json=items, timeout=120)
+        r = requests.post(f"{base}/score/batch", json=payload["items"], timeout=120)
         r.raise_for_status()
+        results_all.extend(r.json())
 
-        batch_results = r.json()  # list[ScoreOutWithContext]
-        results_all.extend(batch_results)
-
-    # Convert response to DataFrame (order preserved)
     res_df = pd.DataFrame(results_all)
-
     out = df.reset_index(drop=True).copy()
     if len(out) != len(res_df):
         raise RuntimeError(f"Response length {len(res_df)} != request length {len(out)}")
 
-    # ---- Normalize probability (0..1) regardless of how backend sends it ----
-    if "probability" in res_df.columns:
-        p = pd.to_numeric(res_df["probability"], errors="coerce").clip(0, 1).fillna(0.0)
-    elif "risk_score" in res_df.columns:
-        # risk_score may be 0..1 (legacy) or 0..100 (percent). Normalize to 0..1
-        rs = pd.to_numeric(res_df["risk_score"], errors="coerce").fillna(0.0)
-        p = rs.where(rs <= 1.0, rs / 100.0).clip(0, 1)
+    # ---- Normalize probability (0..1) with correct precedence ----
+    cols = set(res_df.columns.str.lower())
+    if "risk_score" in cols:
+        p = _to_unit_interval(res_df[[c for c in res_df.columns if c.lower() == "risk_score"][0]])
+    elif "probability" in cols:
+        p = _to_unit_interval(res_df[[c for c in res_df.columns if c.lower() == "probability"][0]])
+    elif "risk_probability" in cols:
+        p = _to_unit_interval(res_df[[c for c in res_df.columns if c.lower() == "risk_probability"][0]])
     else:
-        raise RuntimeError("Backend response missing 'probability'/'risk_score'")
+        raise RuntimeError("Backend response missing 'risk_score'/'probability'/'risk_probability'")
+
+    out["risk_probability"] = p.astype(float)
+    out["risk_score_pct"] = (out["risk_probability"] * 100).round(2)
 
     # ---- Copy other fields (with basic sanitation) ----
-    out["risk_probability"] = p
-    out["risk_score_pct"] = (p * 100).round(2)  # nice for display if you still want a % column
+    if any(c.lower() == "risk_tier" for c in res_df.columns):
+        out["risk_tier"] = res_df[[c for c in res_df.columns if c.lower() == "risk_tier"][0]].astype(str)
 
-    if "risk_tier" in res_df.columns:
-        out["risk_tier"] = res_df["risk_tier"].astype(str)
-    if "suggested_reserve_percent" in res_df.columns:
+    if any(c.lower() == "suggested_reserve_percent" for c in res_df.columns):
         out["suggested_reserve_percent"] = pd.to_numeric(
-            res_df["suggested_reserve_percent"], errors="coerce"
+            res_df[[c for c in res_df.columns if c.lower() == "suggested_reserve_percent"][0]],
+            errors="coerce"
         ).fillna(0.0)
-    if "suggested_settlement_delay_days" in res_df.columns:
+
+    if any(c.lower() == "suggested_settlement_delay_days" for c in res_df.columns):
         out["suggested_settlement_delay_days"] = pd.to_numeric(
-            res_df["suggested_settlement_delay_days"], errors="coerce"
+            res_df[[c for c in res_df.columns if c.lower() == "suggested_settlement_delay_days"][0]],
+            errors="coerce"
         ).fillna(0).astype(int)
 
     # ---- Business calc: expected loss uses probability (not %!) ----
@@ -128,4 +137,3 @@ def score_via_api(df: pd.DataFrame, base_url: str, chunk: int = 3000) -> pd.Data
         )
 
     return out
-
