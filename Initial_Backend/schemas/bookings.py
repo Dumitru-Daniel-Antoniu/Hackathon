@@ -1,9 +1,7 @@
+from pydantic import BaseModel, Field, AliasChoices
 from typing import Optional
-from pydantic import BaseModel, Field
-
 
 class BookingIn(BaseModel):
-    # minimal set — add others if you collect them in your UI
     MERCHANT_ID: Optional[str] = None
     MCC: Optional[int] = None
     VERTICAL: Optional[str] = None
@@ -44,3 +42,26 @@ class Booking(BaseModel):
     BOOKING_AMOUNT: float
     NEW_MERCHANT: int
     SHOCK_FLAG: int
+
+class SimpleBooking(BaseModel):
+    typical_horizon: float = Field(..., ge=0,
+        validation_alias=AliasChoices("typical_horizon", "TYPICAL_HORIZON")
+    )
+    base_fdr: float = Field(..., ge=0,
+        validation_alias=AliasChoices("base_fdr", "BASE_FDR")
+    )
+    shock_flag: int = Field(..., ge=0, le=1,
+        validation_alias=AliasChoices("shock_flag", "SHOCK_FLAG")
+    )
+    days_in_advance: float = Field(..., ge=0,
+        validation_alias=AliasChoices("days_in_advance", "DAYS_IN_ADVANCE")
+    )
+    booking_amount: float = Field(..., ge=0,
+        validation_alias=AliasChoices("booking_amount", "BOOKING_AMOUNT")
+    )
+    vertical: Optional[str] = Field( None,
+        validation_alias=AliasChoices("vertical", "VERTICAL")
+    )
+    country: Optional[str] = Field( None,
+        validation_alias=AliasChoices("country", "COUNTRY")
+    )
