@@ -1,10 +1,10 @@
 import streamlit as st
 from typing import Dict, Any, Optional
+import requests
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Page setup
-# ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Score for an individual booking", page_icon="🧮", layout="wide")
+BACKEND_URL = "http://localhost:8000/score/individual/simple"
+
+st.set_page_config(page_title="Score for an individual booking", page_icon="💳", layout="wide")
 
 # Minimal styles + disable Enter behavior
 st.markdown(
@@ -12,14 +12,10 @@ st.markdown(
     <style>
       .stApp { overflow: auto !important; }
       .block-container { padding-top: 3rem !important; }
-
       .tbl-header { font-weight: 600; font-size: 0.95rem; opacity: 0.95; }
       .grid-6 { display: grid; grid-template-columns: 1.2fr 0.9fr 1.1fr 0.7fr 0.9fr 0.9fr; gap: .6rem; align-items: center; }
-
-      .stButton > button[kind="primary"] {
-        border-radius: 12px;
-        box-shadow: 0 8px 18px rgba(11,19,43,0.12);
-      }
+      .stButton > button[kind="primary"] { border-radius: 12px; box-shadow: 0 8px 18px rgba(11,19,43,0.12); }
+      .result-card { margin-top: 0.5rem; padding: .6rem .8rem; border-radius: 10px; border:1px dashed rgba(0,0,0,.08); }
     </style>
     <script>
       // Block Enter globally so it never applies or triggers reruns
@@ -37,10 +33,7 @@ st.markdown(
         }
       }, true);
       window.addEventListener('submit', function(e) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        e.stopPropagation();
-        return false;
+        e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation(); return false;
       }, true);
     </script>
     """,
@@ -54,21 +47,25 @@ st.title("Score for an individual booking")
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULTS: Dict[str, Any] = {
     "company_name": "",
-    "typical_lead_time": "",
-    "pfr_percent": "",
+    "typical_lead_time": "",   # 0–120
+    "pfr_percent": "",         # 0.00–1.00
     "shock_flag": False,
-    "days_in_advance": "",
-    "booking_amount": "",
+    "days_in_advance": "",     # 0–420
+    "booking_amount": "",      # 0–10000
 }
 if "initialized" not in st.session_state:
     for k, v in DEFAULTS.items():
         st.session_state[k] = v
     st.session_state["initialized"] = True
-if "last_payload" not in st.session_state:
-    st.session_state["last_payload"] = None
+if "last_request" not in st.session_state:
+    st.session_state["last_request"] = None
+if "last_result" not in st.session_state:
+    st.session_state["last_result"] = None
+if "last_error" not in st.session_state:
+    st.session_state["last_error"] = None
 
 def clear_only_fields():
-    """Reset input fields only; keep last_payload intact."""
+    """Reset input fields only; keep last_result and last_request intact."""
     for k, v in DEFAULTS.items():
         st.session_state[k] = v
 
@@ -135,42 +132,104 @@ def validate_and_payload() -> Optional[Dict[str, Any]]:
     if name == "" or tlt is None or pfr is None or dia is None or amt is None:
         st.toast("All fields must be filled with numeric values in the shown ranges.", icon="⚠️")
         return None
-    if not (0 <= tlt <= 120):
-        st.toast("Typical lead time must be between 0 and 120.", icon="⚠️"); return None
-    if not (0.0 <= pfr <= 1.0):
-        st.toast("Prior forward-delivery risk percent must be between 0.00 and 1.00.", icon="⚠️"); return None
-    if not (0 <= dia <= 420):
-        st.toast("Days in advance must be between 0 and 420.", icon="⚠️"); return None
-    if not (0 <= amt <= 10000):
-        st.toast("Booking amount must be between 0 and 10000.", icon="⚠️"); return None
+    if not (0 <= tlt <= 120):   st.toast("Typical lead time must be between 0 and 120.", icon="⚠️"); return None
+    if not (0.0 <= pfr <= 1.0): st.toast("Prior forward-delivery risk percent must be between 0.00 and 1.00.", icon="⚠️"); return None
+    if not (0 <= dia <= 420):   st.toast("Days in advance must be between 0 and 420.", icon="⚠️"); return None
+    if not (0 <= amt <= 10000): st.toast("Booking amount must be between 0 and 10000.", icon="⚠️"); return None
 
-    return {
-        "record": {
-            "Company name": name,
-            "Typical lead time": tlt,
-            "Prior forward-delivery risk percent": pfr,
-            "Shock flag": shock,
-            "Days in advance": dia,
-            "Booking amount": amt,
-        }
+    # The backend endpoint /score/individual/simple expects a single object.
+    # We send keys matching our form field names.
+    payload = {
+        "typical_horizon": tlt,
+        "base_fdr": pfr,
+        "shock_flag": shock,
+        "days_in_advance": dia,
+        "booking_amount": amt,
     }
+    return payload
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Buttons (Send left, Clear right)
 # ──────────────────────────────────────────────────────────────────────────────
 send_col, spacer, clear_col = st.columns([1, 7, 1])
+
 with send_col:
     if st.button("Send", type="primary", key="send_btn"):
+        st.session_state["last_error"] = None
         payload = validate_and_payload()
         if payload is not None:
-            st.session_state["last_payload"] = payload  # no success pop-up
+            # Store request preview
+            st.session_state["last_request"] = payload
+
+            # Call backend
+            try:
+                with st.spinner("Scoring…"):
+                    resp = requests.post(BACKEND_URL, json=payload, timeout=30)
+                if resp.status_code >= 400:
+                    st.session_state["last_error"] = f"Backend returned HTTP {resp.status_code}: {resp.text[:500]}"
+                    st.session_state["last_result"] = None
+                else:
+                    # Expect a single result dict with keys like in your ScoreOutWithContext
+                    data = resp.json()
+                    # Some backends might return {"result": {...}} or a list—handle a few cases gracefully:
+                    if isinstance(data, dict) and "result" in data:
+                        result = data["result"]
+                    elif isinstance(data, list):
+                        result = data[0] if data else {}
+                    else:
+                        result = data
+
+                    st.session_state["last_result"] = {
+                        "probability": result.get("probability"),
+                        "risk_score": result.get("risk_score"),
+                        "risk_tier": result.get("risk_tier"),
+                        "suggested_reserve_percent": result.get("suggested_reserve_percent"),
+                        "suggested_settlement_delay_days": result.get("suggested_settlement_delay_days"),
+                        "merchant_id": result.get("merchant_id"),
+                        "vertical": result.get("vertical"),
+                        "country": result.get("country"),
+                        "days_in_advance": result.get("days_in_advance"),
+                        "booking_amount": result.get("booking_amount"),
+                    }
+            except Exception as e:
+                st.session_state["last_error"] = f"Request failed: {e}"
+                st.session_state["last_result"] = None
 
 with clear_col:
     st.button("Clear", key="clear_btn", on_click=clear_only_fields)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Response section (separate from inputs; shown only if payload exists)
+# Response area (separate from inputs)
 # ──────────────────────────────────────────────────────────────────────────────
-if st.session_state["last_payload"] is not None:
+if st.session_state.get("last_error"):
+    st.error(st.session_state["last_error"])
+
+if st.session_state.get("last_request") is not None:
     st.markdown("**Request preview**")
-    st.json(st.session_state["last_payload"])
+    st.json(st.session_state["last_request"])
+
+if st.session_state.get("last_result") is not None:
+    st.markdown("**Model result**")
+    res = st.session_state["last_result"]
+
+    # Friendly KPI row if the expected keys are present
+    r1, r2, r3 = st.columns(3)
+    if res.get("risk_score") is not None:
+        r1.metric("Risk score", f"{float(res['risk_score']):.2f}")
+    if res.get("risk_score") is not None:
+        r2.metric("Chance of non-delivery", f"{float(res['risk_score']):.2%}")
+    if res.get("risk_tier"):
+        r3.metric("Risk tier", str(res["risk_tier"]))
+
+    # Policy hints if available
+    if (res.get("suggested_reserve_percent") is not None) or (res.get("suggested_settlement_delay_days") is not None):
+        p1, p2 = st.columns(2)
+        if res.get("suggested_reserve_percent") is not None:
+            p1.metric("Suggested reserve (%)", f"{float(res['suggested_reserve_percent']):.2f}")
+        if res.get("suggested_settlement_delay_days") is not None:
+            p2.metric("Suggested payout delay (days)", f"{float(res['suggested_settlement_delay_days']):.0f}")
+
+    # Raw JSON for completeness
+    st.markdown('<div class="result-card">', unsafe_allow_html=True)
+    st.json(res)
+    st.markdown('</div>', unsafe_allow_html=True)
