@@ -1,0 +1,3 @@
+[theme]
+base = "dark"                      # force dark mode for the entire app # optional text color
+font = "sans serif"

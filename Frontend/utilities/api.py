@@ -1,3 +1,6 @@
+# utilities/api.py
+import io
+
 import pandas as pd
 import requests
 from typing import Dict, List
@@ -28,33 +31,30 @@ COL_MAP: Dict[str, str] = {
 
 # Required numeric fields the backend validates strongly
 _NUMERIC_FLOAT = [
-    "TRUST_SCORE","PRIOR_CB_RATE","REFUND_RATE","CANCEL_RATE","SENTIMENT",
-    "SALES_GROWTH_3M","PAYOUT_DELAY_DAYS","RESERVE_PERCENT","DEPOSIT_POLICY_PERCENT",
-    "DAYS_IN_ADVANCE","BOOKING_AMOUNT"
+    "TRUST_SCORE", "PRIOR_CB_RATE", "REFUND_RATE", "CANCEL_RATE", "SENTIMENT",
+    "SALES_GROWTH_3M", "PAYOUT_DELAY_DAYS", "RESERVE_PERCENT", "DEPOSIT_POLICY_PERCENT",
+    "DAYS_IN_ADVANCE", "BOOKING_AMOUNT"
 ]
-_NUMERIC_INT = ["NEW_MERCHANT","SHOCK_FLAG"]
+_NUMERIC_INT = ["NEW_MERCHANT", "SHOCK_FLAG"]
 # Optional context fields (can be absent/NaN and will be dropped from payload)
-_OPTIONAL = ["MERCHANT_ID","MCC","VERTICAL","COUNTRY"]
+_OPTIONAL = ["MERCHANT_ID", "MCC", "VERTICAL", "COUNTRY"]
+
 
 def _build_payload(df: pd.DataFrame, col_map: Dict[str, str]) -> dict:
-    # Check columns exist
     missing = [c for c in col_map.keys() if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in CSV: {missing}")
 
     df = df.reset_index(drop=True).copy()
-
-    # Remap to backend names (keep a copy of original df for merging later)
     backend_cols = {col_map[k]: k for k in col_map.keys()}
 
     items: List[dict] = []
     for _, row in df.iterrows():
         item = {}
-        # Fill mapped fields
         for be_name, csv_name in backend_cols.items():
             val = row[csv_name]
 
-            # Skip optional fields if NaN/None
+            # Skip optional fields if NaN/empty
             if be_name in _OPTIONAL and (pd.isna(val) or val == ""):
                 continue
 
@@ -70,52 +70,92 @@ def _build_payload(df: pd.DataFrame, col_map: Dict[str, str]) -> dict:
 
     return {"items": items}
 
-def score_via_api(df: pd.DataFrame, base_url: str, chunk: int = 3000) -> pd.DataFrame:
+
+def _to_unit_interval(series: pd.Series) -> pd.Series:
+    """Convert numeric to [0,1]; if values look like percentages (>1), divide by 100."""
+    s = pd.to_numeric(series, errors="coerce")
+    s = s.where(s <= 1.0, s / 100.0)
+    return s.clip(0, 1).fillna(0.0)
+
+
+def score_via_api(df: pd.DataFrame, base_url: str) -> pd.DataFrame:
     """
-    Sends df to FastAPI /score_batch and returns an enriched DataFrame
-    with risk_score, risk_tier, suggested_reserve_percent, suggested_settlement_delay_days.
+    Send df once to FastAPI /score/csv (multipart/form-data) and return an enriched DataFrame.
+    Produces (and keeps backward-compat):
+      - risk_probability (0..1)
+      - risk_score_pct (0..100)
+      - risk_score  (alias of risk_probability)   <-- for legacy UI
+      - probability (alias of risk_probability)   <-- for legacy UI
+      - risk_tier, suggested_reserve_percent, suggested_settlement_delay_days
+      - expected_loss$
     """
     base = base_url.rstrip("/")
-    results_all = []
 
-    for i in range(0, len(df), chunk):
-        sl = df.iloc[i:i+chunk]
-        payload = _build_payload(sl, COL_MAP)
+    # --- prepare CSV to match backend headers ---
+    sl = df.copy().rename(columns=COL_MAP)
+    keep = [c for c in COL_MAP.values() if c in sl.columns]
+    sl = sl[keep]
 
-        items = payload["items"]  # <- extract the list
-        r = requests.post(f"{base}/score/batch", json=items, timeout=120)
-        r.raise_for_status()
+    # coerce numerics so CSV cells are clean
+    for c in _NUMERIC_FLOAT:
+        if c in sl.columns:
+            sl[c] = pd.to_numeric(sl[c], errors="coerce")
+    for c in _NUMERIC_INT:
+        if c in sl.columns:
+            sl[c] = pd.to_numeric(sl[c], errors="coerce").fillna(0).astype("Int64")
 
-        # Backend returns a list[ScoreOutWithContext]
-        batch_results = r.json()
-        results_all.extend(batch_results)
+    buf = io.StringIO()
+    sl.to_csv(buf, index=False, lineterminator="\n")
+    files = {"file": ("batch.csv", buf.getvalue().encode("utf-8"), "text/csv")}
 
-    # Convert response list to DataFrame (order preserved = input order)
-    res_df = pd.DataFrame(results_all)
+    # --- single call to CSV endpoint ---
+    r = requests.post(f"{base}/score/csv", files=files, timeout=120)
+    r.raise_for_status()
 
-    # Build output by concatenating original df with response columns
+    # Backend returns List[ScoreOutWithContext]
+    res_df = pd.DataFrame(r.json())
+
     out = df.reset_index(drop=True).copy()
-    # Align lengths as a sanity check
     if len(out) != len(res_df):
         raise RuntimeError(f"Response length {len(res_df)} != request length {len(out)}")
 
-    wanted = [
-        "risk_score",
-        "risk_tier",
-        "suggested_reserve_percent",
-        "suggested_settlement_delay_days"
-    ]
-    for col in wanted:
-        if col not in res_df.columns:
-            raise RuntimeError(f"Backend response missing column: {col}")
+    # ---- Normalize probability (0..1) with correct precedence ----
+    cols_lower = [c.lower() for c in res_df.columns]
+    if "risk_score" in cols_lower:
+        pcol = res_df.columns[cols_lower.index("risk_score")]
+    elif "probability" in cols_lower:
+        pcol = res_df.columns[cols_lower.index("probability")]
+    elif "risk_probability" in cols_lower:
+        pcol = res_df.columns[cols_lower.index("risk_probability")]
+    else:
+        raise RuntimeError("Backend response missing 'risk_score'/'probability'/'risk_probability'")
 
-    out["risk_score"] = res_df["risk_score"].astype(float)
-    out["risk_tier"] = res_df["risk_tier"].astype(str)
-    out["suggested_reserve_percent"] = res_df["suggested_reserve_percent"].astype(float)
-    out["suggested_settlement_delay_days"] = res_df["suggested_settlement_delay_days"].astype(int)
+    p = pd.to_numeric(res_df[pcol], errors="coerce")
+    # if values look like percentages (>1), treat as % and convert to 0..1
+    p = p.where(p <= 1.0, p / 100.0).clip(0, 1).fillna(0.0)
 
-    # convenience column for Watchlist/Business tab
+    # core + backward-compat columns
+    out["risk_probability"] = p.astype(float)
+    out["risk_score_pct"] = (out["risk_probability"] * 100).round(2)
+    out["risk_score"] = out["risk_probability"]  # legacy alias
+    out["probability"] = out["risk_probability"]  # legacy alias
+
+    # ---- Copy other fields (with basic sanitation) ----
+    if "risk_tier" in cols_lower:
+        out["risk_tier"] = res_df[res_df.columns[cols_lower.index("risk_tier")]].astype(str)
+
+    if "suggested_reserve_percent" in cols_lower:
+        col = res_df.columns[cols_lower.index("suggested_reserve_percent")]
+        out["suggested_reserve_percent"] = pd.to_numeric(res_df[col], errors="coerce").fillna(0.0)
+
+    if "suggested_settlement_delay_days" in cols_lower:
+        col = res_df.columns[cols_lower.index("suggested_settlement_delay_days")]
+        out["suggested_settlement_delay_days"] = pd.to_numeric(res_df[col], errors="coerce").fillna(0).astype(int)
+
+    # ---- Business calc: expected loss uses probability (not %!) ----
     if "booking_amount" in out.columns:
-        out["expected_loss$"] = out["risk_score"] * out["booking_amount"].astype(float)
+        dep = pd.to_numeric(out.get("deposit_policy_percent", 0.0), errors="coerce").fillna(0.0) / 100.0
+        exposure = (1.0 - dep).clip(0, 1) * pd.to_numeric(out["booking_amount"], errors="coerce").fillna(0.0)
+        out["expected_loss$"] = out["risk_probability"] * exposure
 
     return out
