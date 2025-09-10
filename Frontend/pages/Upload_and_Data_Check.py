@@ -44,6 +44,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if "scored_df" not in st.session_state:
+    st.session_state["scored_df"] = None
+if "source_label" not in st.session_state:
+    st.session_state["source_label"] = None
+
 st.title("📥 Upload & Data Check")
 st.caption(
     "Drop a CSV. If it’s raw, we’ll score it automatically. "
@@ -52,11 +57,17 @@ st.caption(
 )
 
 # --- Sidebar: backend URL (shared across pages) ---
-api_base = st.sidebar.text_input(
-    "FastAPI base URL",
-    value=st.session_state.get("api_base", "http://localhost:8000"),
-)
-st.session_state["api_base"] = api_base
+# api_base = st.sidebar.text_input(
+#     "FastAPI base URL",
+#     value=st.session_state.get("api_base", "http://localhost:8000"),
+# )
+st.session_state["api_base"] = "http://localhost:8000"
+
+with st.sidebar.expander("Data session"):
+    if st.button("Reset to demo dataset"):
+        st.session_state["scored_df"] = None
+        st.session_state["source_label"] = None
+        st.rerun()
 
 # --- Local default CSV (used when nothing is uploaded) ---
 FRONTEND_DIR = Path(__file__).resolve().parents[1]
@@ -184,45 +195,52 @@ def _is_already_scored(df: pd.DataFrame) -> bool:
     return any(c in low for c in ("risk_probability", "risk_score", "probability"))
 
 
-# --- Source selection: upload or default dataset ---
-uploaded = st.file_uploader("Upload bookings CSV", type=["csv"])
+# --- Source selection: upload, cached, or default ---
+uploaded = st.file_uploader("Upload bookings CSV", type=["csv"], key="bookings_csv")
 
-if uploaded is not None:
-    raw = pd.read_csv(uploaded)
-    source_label = f"uploaded file ({len(raw):,} rows)"
+use_cached = (uploaded is None) and (st.session_state["scored_df"] is not None)
+
+if use_cached:
+    # No new upload: keep what we already scored in this session
+    scored = st.session_state["scored_df"].copy()
+    source_label = st.session_state.get("source_label", "session data")
+
 else:
-    if DEFAULT_DATA.exists():
-        raw = pd.read_csv(DEFAULT_DATA)
-        source_label = f"default dataset: {DEFAULT_DATA.name} ({len(raw):,} rows)"
-        st.info("Using the built-in demo dataset until you upload your own.")
+    # New upload OR first visit (no cache) → read a file
+    if uploaded is not None:
+        raw = pd.read_csv(uploaded)
+        source_label = f"uploaded file ({len(raw):,} rows)"
     else:
-        st.warning("No file uploaded and the default dataset is missing. Please upload a CSV.")
-        st.stop()
+        if DEFAULT_DATA.exists():
+            raw = pd.read_csv(DEFAULT_DATA)
+            source_label = f"default dataset: {DEFAULT_DATA.name} ({len(raw):,} rows)"
+            st.info("Using the built-in demo dataset until you upload your own.")
+        else:
+            st.warning("No file uploaded and the default dataset is missing. Please upload a CSV.")
+            st.stop()
 
-raw = _normalize(raw)
+    raw = _normalize(raw)
 
-# --- Score if needed; otherwise normalize scoring fields ---
-with st.spinner("Processing…"):
-    if _is_already_scored(raw):
-        # File already contains probabilities/scores; normalize and go
-        scored = _normalize_probs(raw)
-        st.success("Detected a scored file — no API call needed.")
-    else:
-        # Build a model-ready payload, call backend, then *normalize the response too*
-        to_score = _ensure_inputs(raw)
-        scored = score_via_api(to_score, st.session_state["api_base"])
-        scored = _normalize_probs(scored)
-        st.success("Scored successfully via backend.")
+    # --- Score if needed; otherwise normalize scoring fields ---
+    with st.spinner("Processing…"):
+        if _is_already_scored(raw):
+            scored = _normalize_probs(raw)
+            st.success("Detected a scored file — no API call needed.")
+        else:
+            to_score = _ensure_inputs(raw)
+            scored = score_via_api(to_score, st.session_state["api_base"])
+            scored = _normalize_probs(scored)
+            st.success("Scored successfully via backend.")
 
-# --- Business calc: expected loss (risk_probability * booking_amount) ---
-if "expected_loss$" not in scored.columns:
-    scored["expected_loss$"] = (
-        pd.to_numeric(scored["risk_probability"], errors="coerce").fillna(0.0)
-        * pd.to_numeric(scored["booking_amount"], errors="coerce").fillna(0.0)
-    )
+    # --- Expected loss = probability × exposure (always overwrite for consistency) ---
+    if "expected_loss$" not in scored.columns:
+        dep = pd.to_numeric(scored.get("deposit_policy_percent", 0.0), errors="coerce").fillna(0.0) / 100.0
+        exposure = (1.0 - dep).clip(0, 1) * pd.to_numeric(scored["booking_amount"], errors="coerce").fillna(0.0)
+        scored["expected_loss$"] = pd.to_numeric(scored["risk_probability"], errors="coerce").fillna(0.0) * exposure
 
-# Persist for other tabs
-st.session_state["scored_df"] = scored
+    # Persist for other pages / revisits
+    st.session_state["scored_df"] = scored.copy()
+    st.session_state["source_label"] = source_label
 
 # --- KPIs ---
 c1, c2, c3, c4 = st.columns(4)

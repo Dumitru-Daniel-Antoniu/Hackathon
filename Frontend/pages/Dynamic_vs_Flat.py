@@ -97,9 +97,15 @@ if "suggested_reserve_percent" in df.columns:
 else:
     dyn_pct = _dynamic_percent_fallback(p, df.get("days_in_advance", 0))
 
+if "deposit_policy_percent" in df.columns:
+    dep = pd.to_numeric(df["deposit_policy_percent"], errors="coerce").fillna(0.0) / 100.0
+    exposure = (1.0 - dep).clip(0, 1) * amount
+else:
+    exposure = amount
+
 # Portfolio baselines
 GMV = float(amount.sum())
-EL = float((p * amount).sum())  # Expected Loss with no reserves
+EL = float((p * exposure).sum())  # Expected Loss with no reserves
 
 # ---------------------------------------------------------------------------
 # 1) Controls (sidebar)
@@ -163,7 +169,7 @@ st.caption(
 # Portfolio top line
 t1, t2 = st.columns(2)
 with t1:
-    st.metric("Portfolio volume (GMV)", money(GMV))
+    st.metric("Bookings total sum (GMV)", money(GMV))
 with t2:
     st.metric("Expected loss with no reserves", money(EL))
 

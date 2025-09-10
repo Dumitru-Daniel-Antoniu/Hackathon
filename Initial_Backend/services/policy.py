@@ -5,9 +5,9 @@ RESERVE_MIN = 2.5  # % held back even for very low risk
 RESERVE_MAX = 50.0  # hard cap (business rule)
 
 
-def _policy(prob: float, days: float) -> Tuple[float, int, str]:
+def _policy(prob: float, days: float, strength: float = 0.65) -> Tuple[float, int, str]:
     reserve_pct = 0
-    pct = prob * 100
+    pct = prob * 100 * strength
     delayed_days = min(45.0, 15.0 * prob + 0.08 * days)
     if 0 <= pct <= 10.5:
         tier = "Trusted Partner"
@@ -24,5 +24,4 @@ def _policy(prob: float, days: float) -> Tuple[float, int, str]:
     else:  # >50 (shouldn’t occur with RESERVE_MAX=50, but kept for completeness)
         tier = "Fraudulent Actor"
         reserve_pct = 75
-
     return reserve_pct, round(delayed_days), tier

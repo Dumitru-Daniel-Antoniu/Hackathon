@@ -154,8 +154,8 @@ def score_via_api(df: pd.DataFrame, base_url: str) -> pd.DataFrame:
 
     # ---- Business calc: expected loss uses probability (not %!) ----
     if "booking_amount" in out.columns:
-        out["expected_loss$"] = (
-                out["risk_probability"] * pd.to_numeric(out["booking_amount"], errors="coerce").fillna(0.0)
-        )
+        dep = pd.to_numeric(out.get("deposit_policy_percent", 0.0), errors="coerce").fillna(0.0) / 100.0
+        exposure = (1.0 - dep).clip(0, 1) * pd.to_numeric(out["booking_amount"], errors="coerce").fillna(0.0)
+        out["expected_loss$"] = out["risk_probability"] * exposure
 
     return out
