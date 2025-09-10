@@ -1,4 +1,6 @@
 # utilities/api.py
+import io
+
 import pandas as pd
 import requests
 from typing import Dict, List
@@ -29,13 +31,13 @@ COL_MAP: Dict[str, str] = {
 
 # Required numeric fields the backend validates strongly
 _NUMERIC_FLOAT = [
-    "TRUST_SCORE","PRIOR_CB_RATE","REFUND_RATE","CANCEL_RATE","SENTIMENT",
-    "SALES_GROWTH_3M","PAYOUT_DELAY_DAYS","RESERVE_PERCENT","DEPOSIT_POLICY_PERCENT",
-    "DAYS_IN_ADVANCE","BOOKING_AMOUNT"
+    "TRUST_SCORE", "PRIOR_CB_RATE", "REFUND_RATE", "CANCEL_RATE", "SENTIMENT",
+    "SALES_GROWTH_3M", "PAYOUT_DELAY_DAYS", "RESERVE_PERCENT", "DEPOSIT_POLICY_PERCENT",
+    "DAYS_IN_ADVANCE", "BOOKING_AMOUNT"
 ]
-_NUMERIC_INT = ["NEW_MERCHANT","SHOCK_FLAG"]
+_NUMERIC_INT = ["NEW_MERCHANT", "SHOCK_FLAG"]
 # Optional context fields (can be absent/NaN and will be dropped from payload)
-_OPTIONAL = ["MERCHANT_ID","MCC","VERTICAL","COUNTRY"]
+_OPTIONAL = ["MERCHANT_ID", "MCC", "VERTICAL", "COUNTRY"]
 
 
 def _build_payload(df: pd.DataFrame, col_map: Dict[str, str]) -> dict:
@@ -76,64 +78,84 @@ def _to_unit_interval(series: pd.Series) -> pd.Series:
     return s.clip(0, 1).fillna(0.0)
 
 
-def score_via_api(df: pd.DataFrame, base_url: str, chunk: int = 3000) -> pd.DataFrame:
+def score_via_api(df: pd.DataFrame, base_url: str) -> pd.DataFrame:
     """
-    Send df to FastAPI /score/batch and return an enriched DataFrame.
-    Produces:
+    Send df once to FastAPI /score/csv (multipart/form-data) and return an enriched DataFrame.
+    Produces (and keeps backward-compat):
       - risk_probability (0..1)
       - risk_score_pct (0..100)
+      - risk_score  (alias of risk_probability)   <-- for legacy UI
+      - probability (alias of risk_probability)   <-- for legacy UI
       - risk_tier, suggested_reserve_percent, suggested_settlement_delay_days
       - expected_loss$
     """
     base = base_url.rstrip("/")
-    results_all: List[dict] = []
 
-    for i in range(0, len(df), chunk):
-        sl = df.iloc[i:i + chunk]
-        payload = _build_payload(sl, COL_MAP)
-        r = requests.post(f"{base}/score/batch", json=payload["items"], timeout=120)
-        r.raise_for_status()
-        results_all.extend(r.json())
+    # --- prepare CSV to match backend headers ---
+    sl = df.copy().rename(columns=COL_MAP)
+    keep = [c for c in COL_MAP.values() if c in sl.columns]
+    sl = sl[keep]
 
-    res_df = pd.DataFrame(results_all)
+    # coerce numerics so CSV cells are clean
+    for c in _NUMERIC_FLOAT:
+        if c in sl.columns:
+            sl[c] = pd.to_numeric(sl[c], errors="coerce")
+    for c in _NUMERIC_INT:
+        if c in sl.columns:
+            sl[c] = pd.to_numeric(sl[c], errors="coerce").fillna(0).astype("Int64")
+
+    buf = io.StringIO()
+    sl.to_csv(buf, index=False, lineterminator="\n")
+    files = {"file": ("batch.csv", buf.getvalue().encode("utf-8"), "text/csv")}
+
+    # --- single call to CSV endpoint ---
+    r = requests.post(f"{base}/score/csv", files=files, timeout=120)
+    r.raise_for_status()
+
+    # Backend returns List[ScoreOutWithContext]
+    res_df = pd.DataFrame(r.json())
+
     out = df.reset_index(drop=True).copy()
     if len(out) != len(res_df):
         raise RuntimeError(f"Response length {len(res_df)} != request length {len(out)}")
 
     # ---- Normalize probability (0..1) with correct precedence ----
-    cols = set(res_df.columns.str.lower())
-    if "risk_score" in cols:
-        p = _to_unit_interval(res_df[[c for c in res_df.columns if c.lower() == "risk_score"][0]])
-    elif "probability" in cols:
-        p = _to_unit_interval(res_df[[c for c in res_df.columns if c.lower() == "probability"][0]])
-    elif "risk_probability" in cols:
-        p = _to_unit_interval(res_df[[c for c in res_df.columns if c.lower() == "risk_probability"][0]])
+    cols_lower = [c.lower() for c in res_df.columns]
+    if "risk_score" in cols_lower:
+        pcol = res_df.columns[cols_lower.index("risk_score")]
+    elif "probability" in cols_lower:
+        pcol = res_df.columns[cols_lower.index("probability")]
+    elif "risk_probability" in cols_lower:
+        pcol = res_df.columns[cols_lower.index("risk_probability")]
     else:
         raise RuntimeError("Backend response missing 'risk_score'/'probability'/'risk_probability'")
 
+    p = pd.to_numeric(res_df[pcol], errors="coerce")
+    # if values look like percentages (>1), treat as % and convert to 0..1
+    p = p.where(p <= 1.0, p / 100.0).clip(0, 1).fillna(0.0)
+
+    # core + backward-compat columns
     out["risk_probability"] = p.astype(float)
     out["risk_score_pct"] = (out["risk_probability"] * 100).round(2)
+    out["risk_score"] = out["risk_probability"]  # legacy alias
+    out["probability"] = out["risk_probability"]  # legacy alias
 
     # ---- Copy other fields (with basic sanitation) ----
-    if any(c.lower() == "risk_tier" for c in res_df.columns):
-        out["risk_tier"] = res_df[[c for c in res_df.columns if c.lower() == "risk_tier"][0]].astype(str)
+    if "risk_tier" in cols_lower:
+        out["risk_tier"] = res_df[res_df.columns[cols_lower.index("risk_tier")]].astype(str)
 
-    if any(c.lower() == "suggested_reserve_percent" for c in res_df.columns):
-        out["suggested_reserve_percent"] = pd.to_numeric(
-            res_df[[c for c in res_df.columns if c.lower() == "suggested_reserve_percent"][0]],
-            errors="coerce"
-        ).fillna(0.0)
+    if "suggested_reserve_percent" in cols_lower:
+        col = res_df.columns[cols_lower.index("suggested_reserve_percent")]
+        out["suggested_reserve_percent"] = pd.to_numeric(res_df[col], errors="coerce").fillna(0.0)
 
-    if any(c.lower() == "suggested_settlement_delay_days" for c in res_df.columns):
-        out["suggested_settlement_delay_days"] = pd.to_numeric(
-            res_df[[c for c in res_df.columns if c.lower() == "suggested_settlement_delay_days"][0]],
-            errors="coerce"
-        ).fillna(0).astype(int)
+    if "suggested_settlement_delay_days" in cols_lower:
+        col = res_df.columns[cols_lower.index("suggested_settlement_delay_days")]
+        out["suggested_settlement_delay_days"] = pd.to_numeric(res_df[col], errors="coerce").fillna(0).astype(int)
 
     # ---- Business calc: expected loss uses probability (not %!) ----
     if "booking_amount" in out.columns:
         out["expected_loss$"] = (
-            out["risk_probability"] * pd.to_numeric(out["booking_amount"], errors="coerce").fillna(0.0)
+                out["risk_probability"] * pd.to_numeric(out["booking_amount"], errors="coerce").fillna(0.0)
         )
 
     return out
